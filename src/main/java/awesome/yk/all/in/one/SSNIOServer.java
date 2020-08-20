@@ -16,7 +16,11 @@ package awesome.yk.all.in.one;
 import com.sun.tools.javac.util.Assert;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.ArrayBlockingQueue;
 
 /**
  * Description: master T
@@ -31,9 +35,8 @@ import java.util.List;
  * *JAVA NIO学习
  * <p>
  * 参考Doug Lea <Scalable IO in Java> 中的Reactor模式
- *
- * @author Yukai
  * @link http://gee.cs.oswego.edu/dl/cpjslides/nio.pdf
+ *
  * <p>
  * 这款WEB原生支持HTTP1.0协议并适应多数场景
  * 单线程模型(线程未必越多越好) -> 后续考虑推出多线程版本(更高效利用多核处理器&IO资源) -> Reactor线程 & Worker线程的拆分...扩展(未来)
@@ -45,12 +48,12 @@ import java.util.List;
  * 文档代码一体:
  * 此Source文件详细描述了每个类与方法的实现与设计思想 在设计上尽可能的满足"可用" "可读" "轻量" "简洁"
  * 个人非常推荐NIO的初学者使用与学习 如果有任何问题与建议 -> 欢迎随时联系
+ *
+ * @author Yukai Tang
  **/
 public class SSNIOServer {
 
     //***********************************抽象*********************************************************
-
-
     /**
      * 用户自定义业务实现的扩展点
      * 责任链模式 -> 可以通过请求的传递完成:
@@ -63,8 +66,7 @@ public class SSNIOServer {
          * @param reqBuffer "正好"代表一个"完整"业务数据包的请求缓存
          * @return 正好"代表一个"完整"业务数据包的响应缓存
          *
-         * 这里...虽然普遍但不绝对:
-         * 请求 响应对应的业务数据包格式不强求一致
+         * 这里...请求 响应对应的业务数据包格式不强求一致
          * e.g 客户端可以 只包含1byte数据的请求获取一个完整的HTTP响应报文
          */
         XBuffer handle(XBuffer reqBuffer);
@@ -121,7 +123,14 @@ public class SSNIOServer {
          */
         public static int X_BUFFER_INITIAL_SIZE = 4 * 1024; //4KB
 
+        /**
+         * IO 事件对应触发的函数之间
+         * 交互用的队列默认大小
+         */
+        public static final int QUEUE_CAPACITY = 1024;
+
     }
+
 
 
     /**
@@ -206,7 +215,7 @@ public class SSNIOServer {
 
 
         /**
-         * 重置指针 & 内部byte[] -> GC ROOT 不再指向原来维护的内部byte[]
+         * 逻辑数据长度 & 内部byte[] -> GC ROOT 不再指向原来维护的内部byte[]
          */
         public void reset() {
             content = new byte[Container.X_BUFFER_INITIAL_SIZE];
@@ -229,5 +238,94 @@ public class SSNIOServer {
         }
 
     }
+
+
+    /**
+     * 关联 -> 一个维护NIO连接的 SocketChannel
+     *
+     */
+    public class DefaultXWriter {
+
+        /**
+         * 在途用于响应的业务数据包队列
+         */
+        private Queue<XBuffer> respQueue;
+
+        /**
+         * 当前在途用于响应的业务数据包
+         */
+        private XBuffer inFlyRespBuffer;
+
+        /**
+         * 记录当前在途用于响应的业务数据包
+         * 在累计的IO 写事件中
+         * 写了多少数据的偏移量指针
+         */
+        private int processingRespOffset;
+
+        /**
+         * 初始
+         */
+        public DefaultXWriter() {
+            respQueue = new ArrayBlockingQueue<XBuffer>(Container.QUEUE_CAPACITY);
+            processingRespOffset = 0;
+        }
+
+
+        /**
+         * NIO 写带来不确定性:
+         * 1. 写了完整一个业务数据包 -> Queue中取下一个业务数据包做为下一个在途响应
+         * 2. 写了部分业务数据包 -> 记录位置...下次对应写IO事件时候Resume
+         * @param  mediator 用于向NIO SocketChannel写数据的过渡缓存
+         * @param  desc 维护客户端连接
+         *
+         * 对应连接下 -> 一次IO 写事件触发一次该函数
+         * 为了降低复杂度 -> 但本次函数感知自己写完一个完整的 用于响应的业务数据包时(processingRespOffset == inFlyRespBuffer.length) -> 结束本次函数
+         * 哪怕在本次IO写事件下 "还允许写更多的数据"
+         * */
+        public void write(ByteBuffer mediator, SocketChannel desc) throws IOException {
+            if (inFlyRespBuffer == null) return;
+
+            mediator.put(inFlyRespBuffer.content
+                    , processingRespOffset
+                    , inFlyRespBuffer.length - processingRespOffset);
+            mediator.flip();
+
+            int bytesWritten = desc.write(mediator);
+            processingRespOffset += bytesWritten;
+
+            while (/**上次写操作是否写了数据**/bytesWritten > 0
+                    && /**是否写了一个完整业务数据包**/mediator.hasRemaining()) {
+                bytesWritten = desc.write(mediator);
+                processingRespOffset += bytesWritten;
+            }
+
+            if (/**写了一个完整业务数据包**/processingRespOffset == inFlyRespBuffer.length) {
+                inFlyRespBuffer = respQueue.poll();
+                processingRespOffset = 0;//重置偏移量
+            }
+            mediator.clear();
+        }
+
+        /**
+         * @param xBuffer 一个完整的响应业务数据包对应的缓存
+         * {@code DefaultXWriter}维护对应SocketChannel下的所有在途 用于响应的业务数据包
+         */
+        public void enqueue(XBuffer xBuffer) {
+            if (inFlyRespBuffer == null) {
+                inFlyRespBuffer = xBuffer;
+            } else {
+                respQueue.offer(xBuffer);
+            }
+        }
+
+        /**
+         * @return 是否有在途 用于响应的业务数据包
+         */
+        public boolean isEmpty() {
+            return inFlyRespBuffer == null;
+        }
+    }
+
 
 }
