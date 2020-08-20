@@ -15,6 +15,9 @@ package awesome.yk.all.in.one;
 
 import com.sun.tools.javac.util.Assert;
 
+import java.io.IOException;
+import java.util.List;
+
 /**
  * Description: master T
  * {@code SSNIOServer}实现了一个超轻量级-嵌入式-支持自定义协议-支持HTTP1.0 的NIO 服务器
@@ -45,6 +48,66 @@ import com.sun.tools.javac.util.Assert;
  **/
 public class SSNIOServer {
 
+    //***********************************抽象*********************************************************
+
+
+    /**
+     * 用户自定义业务实现的扩展点
+     * 责任链模式 -> 可以通过请求的传递完成:
+     * A 弱类型XBuffer -> 强类型自定义业务数据包对象 转换 (请求)
+     * B 强类型自定义业务数据包对象 ->弱类型XBuffer(响应)
+     * 对应Reactor模式下的Worker角色
+     */
+    public interface XHandler {
+        /**
+         * @param reqBuffer "正好"代表一个"完整"业务数据包的请求缓存
+         * @return 正好"代表一个"完整"业务数据包的响应缓存
+         *
+         * 这里...虽然普遍但不绝对:
+         * 请求 响应对应的业务数据包格式不强求一致
+         * e.g 客户端可以 只包含1byte数据的请求获取一个完整的HTTP响应报文
+         */
+        XBuffer handle(XBuffer reqBuffer);
+
+        /**
+         * @return 下一个执行的处理器
+         */
+        XHandler next();
+    }
+
+    /**
+     * 用户识别自定义协议下的业务数据包扩展点
+     * 解决粘包/拆包问题
+     * 实现可参考 {@code DefaultHttpXParser}
+     */
+    public interface XParser {
+
+        /**
+         * @param src "不确定"长度的 经过N(N>1 整数)次NIO read后的缓存
+         * @throws IOException 尝试反序列失败时的相关异常
+         */
+        void parse(XBuffer src) throws IOException;
+
+        /**
+         * @return 反序列化后的"完整"业务数据包数组
+         * 需要用户在实现类维护成功反序列化的数据数组
+         */
+        List<XBuffer> getOutputs();
+    }
+
+
+    /**
+     * 获取XParser实现类的工厂
+     * 简化设计 -> 响应用的自定义协议下的业务数据包统一用{@code XBuffer}表示
+     *
+     * 读操作时使用XParser作为 业务数据包的 识别 & 缓存
+     * 委派{@code DefaultXWriter}执行写操作
+     */
+    public interface CodeCFactory {
+        XParser createXReader();
+    }
+
+    //**********************************实现********************************************************
 
     /**
      * 承载:
@@ -78,7 +141,7 @@ public class SSNIOServer {
      * 一对读/写XBuffer可对应一个NIO Channel
      * 一个XBuffer可对应一个或N(N可以不是整数)个特定协议下的完整业务数据包的二进制数据
      */
-    public static class XBuffer {
+    public class XBuffer {
         /**
          * 客户端连接关联字段
          */
