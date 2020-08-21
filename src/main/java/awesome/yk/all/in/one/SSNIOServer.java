@@ -15,7 +15,6 @@ package awesome.yk.all.in.one;
  *
  */
 
-import com.sun.tools.javac.util.Assert;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
@@ -93,8 +92,6 @@ public class SSNIOServer {
     public XHandler xHandler;
 
     public void start() throws IOException {
-        Assert.checkNonNull(codeCFactory, "Pls set codeCFactory before start SSNIOServer");
-        Assert.checkNonNull(xHandler, "Pls set xHandler before start SSNIOServer");
 
         XAcceptor xAcceptor = new XAcceptor();
         xAcceptor.codeCFactory = codeCFactory;
@@ -373,7 +370,6 @@ public class SSNIOServer {
 
         @Override
         public void run() {
-            Assert.checkNonNull(codeCFactory, "Pls set codeCFactory first");
 
             while (true) {
                 try {
@@ -608,7 +604,6 @@ public class SSNIOServer {
          * @param length 裁剪长度
          */
         public void trim(Integer offset, Integer length) {
-            Assert.check(content.length > offset, "content length must longer than offset value");
 
             byte[] desc = new byte[length];
             System.arraycopy(content, offset, desc, 0, length);
@@ -718,7 +713,6 @@ public class SSNIOServer {
          *                 哪怕在本次IO写事件下 "还允许写更多的数据"
          */
         public void write(ByteBuffer mediator, SocketChannel desc) throws IOException {
-            Assert.checkNonNull(inFlyRespBuffer, "inFlyRespBuffer should not be null after refreshment");
 
             mediator.put(inFlyRespBuffer.content
                     , processingRespOffset
