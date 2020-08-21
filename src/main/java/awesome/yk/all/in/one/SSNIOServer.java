@@ -18,7 +18,9 @@ package awesome.yk.all.in.one;
 import com.sun.tools.javac.util.Assert;
 
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -27,6 +29,8 @@ import java.nio.channels.SocketChannel;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Description: master T
@@ -70,8 +74,62 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * 此版本的SSNIOServer以一个类文件的形式展示(集成对应不同职责的内部类)
  * 也有以多文件形式展示的结构上更清晰的版本
+ *
+ * <p>
+ * 如果你最快地了解如何使用该容器
+ * 启动{@link SSNIOServer#main(java.lang.String[])} 后
+ * 浏览器打开localhost:8080体验一下在HTTP协议下的效果吧
  **/
 public class SSNIOServer {
+
+
+    /**
+     * 用户自定义协议 识别&解析 扩展点
+     **/
+    public CodeCFactory codeCFactory;
+    /**
+     * 用户自定义业务实现的扩展点
+     **/
+    public XHandler xHandler;
+
+    public void start() throws IOException {
+        Assert.checkNonNull(codeCFactory, "Pls set codeCFactory before start SSNIOServer");
+        Assert.checkNonNull(xHandler, "Pls set xHandler before start SSNIOServer");
+
+        XAcceptor xAcceptor = new XAcceptor();
+        xAcceptor.codeCFactory = codeCFactory;
+
+        XReactor xReactor = new XReactor();
+        xReactor.handler = xHandler;
+
+        new Thread(xAcceptor).start();
+        new Thread(xReactor).start();
+        System.err.println("welcome to SSNIO server");
+    }
+
+    public static void main(String[] args) throws IOException {
+        SSNIOServer server = new SSNIOServer();
+        server.codeCFactory =  new HttpCodeCFactory();
+
+        String httpResponse = "HTTP/1.1 200 OK\r\n" +
+                "Content-Length: 51\r\n" +
+                "Content-Type: text/html\r\n" +
+                "\r\n" +
+                "<html><body>Hello FROM SSNIOServer XD</body></html>";
+        byte[] httpResp_bytes = httpResponse.getBytes("UTF-8");
+
+        XHandler handler = requestInXBuffer ->{
+            XBuffer xBuffer = new XBuffer();
+            xBuffer.xSocketId = requestInXBuffer.xSocketId;
+            xBuffer.cache(httpResp_bytes);
+            return xBuffer;
+        };
+
+        server.xHandler = handler;
+
+        server.start();
+    }
+
 
     //***********************************抽象*********************************************************
 
@@ -99,7 +157,7 @@ public class SSNIOServer {
         /**
          * @return 下一个执行的处理器
          */
-        XHandler next();
+        default XHandler  next() {return null;};
     }
 
     /**
@@ -194,8 +252,8 @@ public class SSNIOServer {
         /**
          * 对应INBOUND_QUEUE
          * 联系:
-         *  1 承载由XHandler生成 响应对应的业务数据包载体XBuffer
-         *  2 XReactor在一次循环中取出全部XBuffer -> A:更新写事件相关Selector的监听信息 B:往对应XSocket中DefaultXWriter塞入XBuffer
+         * 1 承载由XHandler生成 响应对应的业务数据包载体XBuffer
+         * 2 XReactor在一次循环中取出全部XBuffer -> A:更新写事件相关Selector的监听信息 B:往对应XSocket中DefaultXWriter塞入XBuffer
          */
         public static Queue<XBuffer> OUTBOUND_QUEUE = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
@@ -468,7 +526,6 @@ public class SSNIOServer {
             inactiveWritingSocketsMap.clear();
         }
 
-
         private void writeToReadyChannel() throws IOException {
             int selectedCount = writeSelector.selectNow();
             if (selectedCount > 0) {
@@ -487,7 +544,6 @@ public class SSNIOServer {
                 selectionKeys.clear();
             }
         }
-
     }
 
 
@@ -508,7 +564,7 @@ public class SSNIOServer {
      * 一对读/写XBuffer可对应一个NIO Channel
      * 一个XBuffer可对应一个或N(N可以不是整数)个特定协议下的完整业务数据包的二进制数据
      */
-    public class XBuffer {
+    public static class XBuffer {
         /**
          * 客户端连接关联字段
          */
@@ -656,7 +712,7 @@ public class SSNIOServer {
          *                 哪怕在本次IO写事件下 "还允许写更多的数据"
          */
         public void write(ByteBuffer mediator, SocketChannel desc) throws IOException {
-            Assert.checkNonNull(inFlyRespBuffer,"inFlyRespBuffer should not be null after refreshment");
+            Assert.checkNonNull(inFlyRespBuffer, "inFlyRespBuffer should not be null after refreshment");
 
             mediator.put(inFlyRespBuffer.content
                     , processingRespOffset
@@ -699,5 +755,279 @@ public class SSNIOServer {
         }
     }
 
+    /********************************作为扩展点加入的HTTP相关组件  如果使用自定义协议可删除*******************************************/
 
+    /**
+     * 协议HTTP下请求对应的模型
+     * 提供简单的:
+     * URI参数获取
+     * 报文Header部分字符串获取
+     * 报文Body部分字符串获取
+     * 大道至简 通讯皆为字节流 -> 何必转来转去徒增烦恼
+     **/
+    public static class HttpRequest extends XBuffer {
+        /**
+         * 请求头在XBuffer.content中偏移量
+         */
+        public int headersOffset;
+        /**
+         * 请求实体在XBuffer.content中偏移量
+         */
+        public int bodyOffset;
+        /**
+         * URI参数
+         */
+        public Map<String, String> uriParamsMap;
+
+        /**
+         * 获取URI参数
+         */
+        public Map<String, String> tryGetUriParams() {
+            try {
+                if (uriParamsMap != null) return uriParamsMap;
+                uriParamsMap = new HashMap<>();
+                String requestLine = tryGetStr(0, headersOffset, "utf-8");
+                requestLine = URLDecoder.decode(requestLine);
+
+                String[] pieces = requestLine.split("\\?");
+
+                if (pieces.length != 2) return new HashMap<>();
+
+                String paramSetStr = pieces[1];
+                String paramReg = "\\w+=\\w+";
+                Pattern pattern = Pattern.compile(paramReg);
+                Matcher matcher = pattern.matcher(paramSetStr);
+
+                while (matcher.find()) {
+                    String param_pair_str = matcher.group();
+                    String[] key_value_arr = param_pair_str.split("=");
+                    uriParamsMap.put(key_value_arr[0], key_value_arr[1]);
+                }
+                return uriParamsMap;
+            } catch (Exception e) {
+                System.err.println("URI parameters parsing exception:" + e);
+                return new HashMap<>();
+            }
+
+        }
+
+        /**
+         * 获取首部段字符串
+         */
+        public String getHeaderStr() {
+            int headerLength;
+            if (bodyOffset == -1) {
+                headerLength = super.length - headersOffset;
+            } else {
+                headerLength = bodyOffset - headersOffset;
+            }
+
+            return tryGetStr(headersOffset, headerLength, "UTF-8");
+        }
+
+        /**
+         * 获取实体字符串
+         */
+        public String getBodyStr() {
+            if (bodyOffset == -1) return "";
+
+            int bodyLength = super.length - bodyOffset;
+
+            return tryGetStr(bodyOffset, bodyLength, "UTF-8");
+        }
+
+        /**
+         * 获取字符串
+         */
+        private String tryGetStr(int offset, int length, String charset) {
+            if (length <= 0) return "";
+            byte[] bytes_buffer = new byte[length];
+            System.arraycopy(super.content, offset, bytes_buffer, 0, length);
+
+            String rst;
+            try {
+                rst = new String(bytes_buffer, charset);
+            } catch (UnsupportedEncodingException e) {
+                rst = "";
+            }
+            return rst;
+        }
+    }
+
+
+    public static class DefaultHttpXParser implements XParser {
+        private List<XBuffer> requests = new ArrayList<>();
+        private boolean endOfStreamReached =false;
+        @Override
+        public void parse(XBuffer src) throws IOException {
+            // XBuffer  -> contains the bytes read from NIO read
+            HttpRequest request = HttpUtil.tryToParseHttpRequest(src);
+            while (request != null) {
+                requests.add(request);
+                request = HttpUtil.tryToParseHttpRequest(src);
+            }
+        }
+        @Override
+        public List<XBuffer> getOutputs() {
+            if (requests.size() == 0) return new ArrayList<>();
+            return requests;
+        }
+    }
+
+    public static class HttpCodeCFactory implements CodeCFactory {
+        @Override
+        public XParser createXReader() {
+            return new DefaultHttpXParser();
+        }
+    }
+
+    /**
+     * 取第一行 -> 作为请求行
+     * 不断取后面行作为header行,并且判断有没有content-length
+     * 取到连续两次\r\n(header与body之间有两行) 作为body
+     **/
+    public static class HttpUtil {
+        /**
+         * must contained from a complete http request
+         */
+        private static final byte[] CONTENT_LENGTH = new byte[]{'C', 'o', 'n', 't', 'e', 'n', 't', '-', 'L', 'e', 'n', 'g', 't', 'h'};
+
+        public static HttpRequest tryToParseHttpRequest(XBuffer readerBuffer) throws IOException {
+            if (readerBuffer.length == 0) {
+                return null;
+            }
+            readerBuffer.trim(0, readerBuffer.length);
+            byte[] content = readerBuffer.content;
+
+            int request_line_end_index = findNextLine(0, content.length, content);
+            if (request_line_end_index == -1) return null;
+
+            int header_start_index = request_line_end_index + 1;
+            int header_end_index = findNextLine(header_start_index, content.length, content);
+            int content_length = 0;
+
+            while (/**not qualified**/header_end_index != -1 && /**reach body**/header_end_index != header_start_index + 1) {
+                if (matches(content, header_start_index, CONTENT_LENGTH)) {
+                    content_length = findContentLength
+                            (content, header_start_index, header_end_index);
+                }
+                header_start_index = header_end_index + 1;
+                header_end_index = findNextLine(header_start_index, content.length, content);
+            }
+
+            if (/**header not complete**/header_end_index == -1) return null;
+            if (content_length == 0) {
+                //return a request without body
+                HttpRequest request = new HttpRequest();
+                request.xSocketId = readerBuffer.xSocketId;
+                request.content = content;
+                request.headersOffset = request_line_end_index + 1;
+                request.bodyOffset = -1;
+                request.length =content.length;
+                //clear all data of readerBuffer;
+                readerBuffer.reset();
+                return request;
+            }
+            //try to parse body
+            int body_start_index = header_end_index + 1;
+            int body_end_index = body_start_index + content_length;
+
+            if (body_end_index == content.length) {
+                // rare but perfect condition
+                HttpRequest request = new HttpRequest();
+                request.xSocketId = readerBuffer.xSocketId;
+                request.content = content;
+                request.headersOffset = request_line_end_index + 1;
+                request.bodyOffset = body_start_index;
+                request.length = content.length;
+
+                //clear all data of readerBuffer;
+                readerBuffer.reset();
+                return request;
+            } else if (body_end_index < content.length) {
+                //拆包
+                HttpRequest request = new HttpRequest();
+                byte[] request_content = new byte[body_end_index];
+                System.arraycopy(content, 0, request_content, 0, body_end_index);
+
+                request.xSocketId = readerBuffer.xSocketId;
+                request.content = content;
+                request.headersOffset = request_line_end_index + 1;
+                request.bodyOffset = body_start_index;
+                request.length = content.length;
+                // remain the rest part of buffer
+                int offset = body_end_index + 1;
+                readerBuffer.trim(offset, readerBuffer.length - offset);
+                return request;
+            }
+            return null;
+        }
+
+        private static int findContentLength(byte[] src, int startIndex, int endIndex) throws UnsupportedEncodingException {
+            int indexOfColon = findNext(src, startIndex, endIndex, (byte) ':');
+            //skip spaces after colon
+            int index = indexOfColon + 1;
+            while (src[index] == ' ') {
+                index++;
+            }
+            int valueStartIndex = index;
+            int valueEndIndex = index;
+            boolean endOfValueFound = false;
+
+            while (index < endIndex && !endOfValueFound) {
+                switch (src[index]) {
+                    case '0':
+                        ;
+                    case '1':
+                        ;
+                    case '2':
+                        ;
+                    case '3':
+                        ;
+                    case '4':
+                        ;
+                    case '5':
+                        ;
+                    case '6':
+                        ;
+                    case '7':
+                        ;
+                    case '8':
+                        ;
+                    case '9': {
+                        index++;
+                        break;
+                    }
+                    default: {
+                        endOfValueFound = true;
+                        valueEndIndex = index;
+                    }
+                }
+            }
+            return Integer.parseInt(new String(src, valueStartIndex, valueEndIndex - valueStartIndex, "UTF-8"));
+        }
+        private static int findNext(byte[] src, int startIndex, int endIndex, byte value) {
+            for (int index = startIndex; index < endIndex; index++) {
+                if (src[index] == value) return index;
+            }
+            return -1;
+        }
+        private static boolean matches(byte[] src, int offset, byte[] value) {
+            for (int i = offset, n = 0; n < value.length; i++, n++) {
+                if (src[i] != value[n]) return false;
+            }
+            return true;
+        }
+        private static int findNextLine(int startIndex, int endIndex, byte[] src) {
+            for (int index = startIndex; index < endIndex; index++) {
+                if (src[index] == '\n') {
+                    if (src[index - 1] == '\r') {
+                        return index;
+                    }
+                }
+                ;
+            }
+            return -1;
+        }
+    }
 }
