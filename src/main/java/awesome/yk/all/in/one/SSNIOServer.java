@@ -18,7 +18,9 @@ package awesome.yk.all.in.one;
 import com.sun.tools.javac.util.Assert;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.List;
 import java.util.Queue;
@@ -44,7 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>
  * 这款WEB原生支持HTTP1.0协议并适应多数场景
- * 单线程模型(线程未必越多越好) -> 后续考虑推出多线程版本(更高效利用多核处理器&IO资源) -> Reactor线程 & Worker线程的拆分...扩展(未来)
+ * 双线程模型(Acceptor&Reactor...线程未必越多越好) -> 后续考虑推出多线程版本(更高效利用多核处理器&IO资源) -> Reactor线程 & Worker线程的拆分...扩展(未来)
  * <p>
  * SSNIOServer 的完整功能由一个Source文件(此文件)展示 -> 尽可能地降低使用难度(只需要简单的引入该文件就能享受)
  * SSNIO没有使用任何第三方依赖并且集成了HTTP 1.0 的解析实现(往往协议的decode/encode需要使用者自己实现) -> 使用者不用担心任何依赖冲突问题xD
@@ -108,11 +110,11 @@ public class SSNIOServer {
 
         /**
          * @param src "不确定"长度的 经过N(N>1 整数)次NIO read后累加的缓存
-         *
-         * 函数对应的功能:
-         * 1 识别缓存(XBuffer)数据是否足够成为一个完整特定协议下的业务数据包(e.g HTTP下的一个完整报文)
-         * 2 使用缓存(XBuffer)中的数据反序列化业务数据包
-         * 3 释放缓存(XBuffer)中被成功用于反序列化的数据,保留未被用于反序列化的数据
+         *            <p>
+         *            函数对应的功能:
+         *            1 识别缓存(XBuffer)数据是否足够成为一个完整特定协议下的业务数据包(e.g HTTP下的一个完整报文)
+         *            2 使用缓存(XBuffer)中的数据反序列化业务数据包
+         *            3 释放缓存(XBuffer)中被成功用于反序列化的数据,保留未被用于反序列化的数据
          */
         void parse(XBuffer src) throws IOException;
 
@@ -143,6 +145,12 @@ public class SSNIOServer {
      * 全局函数(比如id生成函数)
      */
     public static class Container {
+
+        /**
+         * 端口
+         */
+        public static final int PORT = 8080;
+
         /**
          * 缓存初始值
          */
@@ -172,6 +180,15 @@ public class SSNIOServer {
          * 传递业务数据包到序列化相关XHandler -> 业务模型
          */
         public static ByteBuffer READING_MEDIATOR = ByteBuffer.allocate(X_BUFFER_INITIAL_SIZE * 100);
+
+
+        /**
+         * NIO 事件触发的对应函数之间交互用队列
+         * 联系:
+         * 1 Acceptor相关对象监听IO Accept事件 生成的SocketChannel的封装对象XSocket 放入该队列
+         * 1 Reactor相关对象在一次循环中取出全部XSocket对象中SocketChannel -> 向Selector注册Read事件的监听
+         */
+        public static Queue<XSocket> INBOUND_QUEUE = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
         /**
          * 竞争安全的ID 生成函数
@@ -241,7 +258,7 @@ public class SSNIOServer {
 
         /**
          * @param mediator NIO SocketChannel接收的缓存参数
-         * 尝试重复读取 -> 读到本次IO 读事件下无法读取更多数据为止
+         *                 尝试重复读取 -> 读到本次IO 读事件下无法读取更多数据为止
          */
         private int keepReadingToByteBuffer(ByteBuffer mediator) throws IOException {
             int bytesRead = socketChannel.read(mediator);
@@ -253,6 +270,52 @@ public class SSNIOServer {
             }
 
             return totalBytesRead;
+        }
+    }
+
+    /**
+     * 阻塞型 IO Accept事件监听器
+     * 职责:
+     * 监听端口 -> 生成SocketChannel封装对象XSocket -> 推送队列
+     * 由线程单独启动(为了不阻塞其他非阻塞型操作)
+     * 该对象全局唯一且不会随着连接/请求的增加而改变 -> 从Reactor对象中抽离且由单独线程维护便于更好的理解
+     */
+    public class XAcceptor implements Runnable {
+
+        /**
+         * 阻塞式 服务端channel
+         * 阻塞状态...直到连接建立
+         */
+        private ServerSocketChannel ssc;
+
+        /**
+         * 用于获取 自定义协议下的业务数据包解析器的简单工厂
+         */
+        public CodeCFactory codeCFactory;
+
+        public XAcceptor() throws IOException {
+            this.ssc = ServerSocketChannel.open();
+            ssc.bind(new InetSocketAddress(Container.PORT));
+        }
+
+        @Override
+        public void run() {
+            Assert.checkNonNull(codeCFactory, "Pls set codeCFactory first");
+
+            while (true) {
+                try {
+                    SocketChannel sc = ssc.accept();
+                    //服务端监听端口对应的ServerSocketChannel -> 阻塞式
+                    //客户端连接对应的SocketChannel -> 非阻塞式
+                    sc.configureBlocking(false);
+                    XSocket xSocket = new XSocket(sc);
+                    xSocket.xParser = codeCFactory.createXReader();
+
+                    Container.INBOUND_QUEUE.offer(xSocket);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
         }
     }
 
