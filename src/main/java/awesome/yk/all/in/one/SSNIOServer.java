@@ -119,6 +119,11 @@ public class SSNIOServer {
         byte[] httpResp_bytes = httpResponse.getBytes("UTF-8");
 
         XHandler handler = requestInXBuffer ->{
+
+            HttpRequest httpRequest = (HttpRequest) requestInXBuffer;
+            System.err.println("HEADER:"+httpRequest.getHeaderStr());
+            System.err.println("BODY:"+httpRequest.getBodyStr());
+
             XBuffer xBuffer = new XBuffer();
             xBuffer.xSocketId = requestInXBuffer.xSocketId;
             xBuffer.cache(httpResp_bytes);
@@ -293,6 +298,7 @@ public class SSNIOServer {
             this.readBuffer.xSocketId = this.xSocketId;
             this.writeBuffer = new XBuffer();
             this.writeBuffer.xSocketId = this.xSocketId;
+            this.xWriter = new DefaultXWriter();
         }
 
         /**
