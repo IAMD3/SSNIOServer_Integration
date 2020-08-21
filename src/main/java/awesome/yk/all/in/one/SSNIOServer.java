@@ -20,10 +20,11 @@ import com.sun.tools.javac.util.Assert;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
-import java.util.List;
-import java.util.Queue;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -185,10 +186,18 @@ public class SSNIOServer {
         /**
          * NIO 事件触发的对应函数之间交互用队列
          * 联系:
-         * 1 Acceptor相关对象监听IO Accept事件 生成的SocketChannel的封装对象XSocket 放入该队列
-         * 1 Reactor相关对象在一次循环中取出全部XSocket对象中SocketChannel -> 向Selector注册Read事件的监听
+         * 1 XAcceptor监听IO Accept事件 生成的SocketChannel的封装对象XSocket 放入该队列
+         * 2 XReactor在一次循环中取出全部XSocket对象中SocketChannel -> 向Selector注册Read事件的监听
          */
         public static Queue<XSocket> INBOUND_QUEUE = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+
+        /**
+         * 对应INBOUND_QUEUE
+         * 联系:
+         *  1 承载由XHandler生成 响应对应的业务数据包载体XBuffer
+         *  2 XReactor在一次循环中取出全部XBuffer -> A:更新写事件相关Selector的监听信息 B:往对应XSocket中DefaultXWriter塞入XBuffer
+         */
+        public static Queue<XBuffer> OUTBOUND_QUEUE = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
         /**
          * 竞争安全的ID 生成函数
@@ -208,7 +217,7 @@ public class SSNIOServer {
      * 维护一组读写缓存(XBuffer)
      * 维护一个特定协议下的业务数据包解析器(XParser)
      * 维护一个通用的 跨协议的Writer(单个响应对应的业务数据包必须对应单个XBuffer缓存)
-     * XSocket维护了读写相关组件/缓存的一对一对应关系
+     * XSocket如同一个桥梁->维护了读写相关组件/缓存的一对一对应关系
      */
     public class XSocket {
         public String xSocketId;
@@ -317,6 +326,168 @@ public class SSNIOServer {
                 }
             }
         }
+    }
+
+
+    /**
+     * 参考Doug Lea Reactor Pattern
+     * Reactor对象
+     * SSNIOServer 中最核心模块
+     * <p>
+     * 维护:
+     * A 执行业务模型序列化 & 反序列化 & 处理的XHandler
+     * B 监听IO 读 & 写事件的Selector组
+     * C IO Accept 事件产生的XSocket容器connectedSocketsMap
+     * D 记录 待被写入客户端的在途业务数据包对应的XSocket容器activeWritingSocketsMap
+     * E 记录 不再需要监听IO写事件的SocketChannel 的封装对象XSocket容器inactiveWritingSocketsMap
+     * <p>
+     * 由单独线程启动 执行"无限次"的循环:
+     * 1 获取所有IO Accept事件产生的SocketChannel -> 向Selector注册读事件的监听
+     * 2 向读事件对应的Selector咨询 产生"IO读事件"对应的SocketChannel, 找到封装对象XSocket-> 执行读取后 委派XParser进行缓存 尝试解析
+     * 3 在上一步成功获取"完整"业务数据包的场景下 执行XHandler 进行 : A 业务数据包载体XBuffer -> 业务模型转换 B业务模型处理 C 业务模型 -> 响应对应的业务数据包载体XBuffer转换
+     * 4 在XHandler产生XBuffer场景下 通过对应xSocketId找到SocketChannel封装对象XSocket后: A 推送XBuffer到对应的DefaultXWriter B 更新XSocket容器组 activeWritingSocketsMap & inactiveWritingSocketsMap
+     * 5 通过XSocket容器组 向写事件对应的Selector更新注册信息(可能再次注册上个循环中注册的成员)
+     * 6 向写事件对应的Selector咨询 产生"IO写事件"对应的SocketChannel, 找到封装对象XSocket-> 委派DefaultXWriter进行写操作
+     * 7 向DefaultXWriter咨询是否还有待写入的业务数据包,更新inactiveWritingSocketsMap信息
+     * 8 下一个循环....
+     */
+    public class XReactor implements Runnable {
+        public XHandler handler;
+
+        private Map<String, XSocket> connectedSocketsMap;
+        private Map<String, XSocket> activeWritingSocketsMap;
+        private Map<String, XSocket> inactiveWritingSocketsMap;
+
+        private Selector readSelector;
+        private Selector writeSelector;
+
+        public XReactor() throws IOException {
+            this.connectedSocketsMap = new HashMap<>();
+            this.activeWritingSocketsMap = new HashMap<>();
+            inactiveWritingSocketsMap = new HashMap<>();
+            this.readSelector = Selector.open();
+            this.writeSelector = Selector.open();
+        }
+
+        @Override
+        public void run() {
+
+            while (true) {
+                try {
+                    /*****************读相关*********************************/
+                    registerAllAcceptedSockets();//步骤1
+                    readReadySockets();//步骤2 & 3 & 4A
+                    /****************写相关*********************************/
+                    refreshWritingSocketsInfo(); //步骤4B
+                    refreshRegistrationOfWringSockets();//步骤5
+                    writeToReadyChannel();//步骤 6 & 7
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+
+        /**************************************私有函数*********************************************/
+        private void registerAllAcceptedSockets() throws IOException {
+            XSocket socket = Container.INBOUND_QUEUE.poll();
+
+            while (socket != null) {
+                SelectionKey sk = socket.socketChannel
+                        .register(readSelector, SelectionKey.OP_READ);
+
+                sk.attach(socket);
+                this.connectedSocketsMap.put(socket.xSocketId, socket);
+                socket = Container.INBOUND_QUEUE.poll();
+            }
+        }
+
+        private void readReadySockets() throws IOException {
+            int selectedCount = readSelector.selectNow();
+
+            if (selectedCount > 0) {
+                Set<SelectionKey> selectionKeys = readSelector.selectedKeys();
+                Iterator<SelectionKey> it = selectionKeys.iterator();
+
+                while (it.hasNext()) {
+                    SelectionKey nextSelectionKey = it.next();
+                    XSocket xSocket = (XSocket) nextSelectionKey.attachment();
+
+                    xSocket.read();
+                    List<XBuffer> completeMsgBufferBlocks = xSocket.xParser.getOutputs();
+
+                    if (/**本次IO读事件下解析出完整的业务数据包**/completeMsgBufferBlocks.size() > 0) {
+                        if (handler != null) {
+                            /**执行XHandler 进行 :
+                             *  A 业务数据包载体XBuffer -> 业务模型转换
+                             *  B 业务模型处理
+                             *  C 业务模型 -> 响应对应的业务数据包载体XBuffer转换**/
+                            completeMsgBufferBlocks
+                                    .stream()
+                                    .map(handler::handle)
+                                    .forEach(Container.OUTBOUND_QUEUE::offer);
+                            completeMsgBufferBlocks.clear();
+                        }
+                    }
+                    it.remove();
+                }
+                selectionKeys.clear();
+            }
+        }
+
+        private void refreshWritingSocketsInfo() {
+            XBuffer completeMsgBufferBlock = Container.OUTBOUND_QUEUE.poll();
+
+            while (completeMsgBufferBlock != null) {
+                String xSocketId = completeMsgBufferBlock.xSocketId;
+                XSocket associatedSocket = connectedSocketsMap.get(xSocketId);
+
+                associatedSocket.xWriter
+                        .enqueue(completeMsgBufferBlock);
+                activeWritingSocketsMap.put(xSocketId, associatedSocket);
+                inactiveWritingSocketsMap.remove(xSocketId);
+
+                completeMsgBufferBlock = Container.OUTBOUND_QUEUE.poll();
+            }
+        }
+
+        private void refreshRegistrationOfWringSockets() throws IOException {
+            Collection<XSocket> activeSockets = activeWritingSocketsMap.values();
+            /**可能会重复注册上个循环中已注册的SocketChannel**/
+            for (XSocket socket : activeSockets) {
+                SelectionKey sk = socket.socketChannel.
+                        register(writeSelector, SelectionKey.OP_WRITE);
+                sk.attach(socket);
+            }
+            activeWritingSocketsMap.clear();
+            Collection<XSocket> inactiveSockets = inactiveWritingSocketsMap.values();
+            for (XSocket socket : inactiveSockets) {
+                SelectionKey sk = socket.socketChannel.keyFor(writeSelector);
+                sk.cancel();
+            }
+            inactiveWritingSocketsMap.clear();
+        }
+
+
+        private void writeToReadyChannel() throws IOException {
+            int selectedCount = writeSelector.selectNow();
+            if (selectedCount > 0) {
+                Set<SelectionKey> selectionKeys = writeSelector.selectedKeys();
+                Iterator<SelectionKey> it = selectionKeys.iterator();
+                while (it.hasNext()) {
+                    SelectionKey selectionKey = it.next();
+                    XSocket writableXSocket = (XSocket) selectionKey.attachment();
+
+                    writableXSocket.write();
+                    if (writableXSocket.xWriter.isEmpty()) {
+                        inactiveWritingSocketsMap.put(writableXSocket.xSocketId, writableXSocket);
+                    }
+                    it.remove();
+                }
+                selectionKeys.clear();
+            }
+        }
+
     }
 
 
@@ -485,7 +656,7 @@ public class SSNIOServer {
          *                 哪怕在本次IO写事件下 "还允许写更多的数据"
          */
         public void write(ByteBuffer mediator, SocketChannel desc) throws IOException {
-            if (inFlyRespBuffer == null) return;
+            Assert.checkNonNull(inFlyRespBuffer,"inFlyRespBuffer should not be null after refreshment");
 
             mediator.put(inFlyRespBuffer.content
                     , processingRespOffset
