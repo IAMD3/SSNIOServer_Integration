@@ -1,4 +1,3 @@
-package awesome.yk.all.in.one;
 /*
  *  Copyright ©  Yukai Tang
  *  SSNIO Server -> 带给你轻量级的NIO Server体验
